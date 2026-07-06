@@ -2,17 +2,20 @@
 Pick the Lock Bot — plays the Dota 2 "Dark Carnival" Pick the Lock mini-game.
 
 The game: a lock-pick rotates around a circular dial. You LEFT-CLICK the moment the
-pick passes over a highlighted bar (yellow = +points, blue = +time). Holding the
-RIGHT mouse button speeds the pick up. Clicking off a bar penalises you (the pick
-slows and picking is briefly disabled), so timing must be precise.
+pick passes over a highlighted bar (gold = +points, blue = +time). The bars START
+WIDE and SHRINK until they vanish, so you must hit them quickly. Holding the RIGHT
+mouse button speeds the pick up. Clicking off a bar penalises you (the pick slows
+and picking is briefly disabled), so timing must be precise.
 
-This bot:
-  1. Screen-captures the calibrated dial (centre + radius set once).
-  2. Tracks the rotating pick's ANGLE by frame-differencing inside the ring.
-  3. Finds the yellow/blue bars by sampling colours around the ring.
-  4. Predicts the pick's angle a couple of frames ahead (to beat capture + click
-     latency) and LEFT-CLICKS when that lands on a bar.
-  5. Optionally HOLDS the RIGHT button to keep the pick at max speed.
+Detection (colour-agnostic, so it works for gold, blue, or a recoloured pick):
+  * PICK  — the fast-moving element, found by frame-differencing inside the ring;
+            we track its ANGLE and angular velocity.
+  * BARS  — saturated pixels on the dial face that PERSIST at a fixed angle across
+            several frames. The pick moves so it never persists in one spot; the
+            flying spark particles move too — only the real (shrinking) bars stay
+            put, so this cleanly separates bars from pick and sparks.
+Then we predict the pick's angle a couple of frames ahead and LEFT-CLICK when that
+lands on a bar. Optionally HOLD RIGHT to keep the pick at max speed.
 
 Hotkeys (global)
     F8  — toggle bot ON / OFF (starts OFF)
@@ -30,7 +33,6 @@ import json
 import time
 import math
 import ctypes
-from collections import deque
 
 import numpy as np
 import cv2
@@ -41,7 +43,6 @@ import keyboard
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 
-# DPI-aware so calibration mouse coords and captured pixels share one coordinate space.
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
@@ -57,23 +58,26 @@ PREVIEW_WIN = "Pick the Lock Bot — preview"
 DEFAULTS = {
     "region": None,            # {left, top, width, height} absolute screen px
     "center": None,            # [cx, cy] region-local centre of the dial
-    "radius": None,            # px — radius of the ring the pick travels on
-    "ring_width": 16,          # px thickness of the annulus sampled for pick & bars
-    "n_samples": 360,          # angular resolution (samples around the ring)
-    "diff_thresh": 16,         # frame-diff threshold for finding the moving pick
-    "min_move_area": 4,        # min changed-blob area (px) to accept a pick reading
-    # Bar colours (BGR). These are starting guesses — tune with capture.bat.
-    "yellow_color": [40, 205, 240],
-    "blue_color": [235, 175, 45],
-    "color_tol": 60,           # per-channel colour tolerance for a bar match
-    "min_bar_samples": 3,      # need this many matching angles to count a bar
-    "click_margin_deg": 7,     # treat a bar as this many degrees wider (click window)
+    "radius": None,            # px — radius of the ring the bars sit on
+    "n_samples": 360,          # angular resolution (bins around the circle)
+    "diff_thresh": 15,         # frame-diff threshold for the moving pick
+    "min_move_area": 4,        # min moving-blob area (px) to accept a pick reading
+    # Bars are found by SATURATION + PERSISTENCE, not by a fixed colour.
+    "sat_min": 30,             # min (max-min) channel spread to be a "coloured" pixel
+    "v_min": 65,               # min brightness (brightest channel) for a bar pixel
+    "bar_inner_margin": 34,    # bar search annulus = [radius-this, radius+bar_outer_margin]
+    "bar_outer_margin": 24,
+    "pick_inner_margin": 48,   # pick search annulus around the radius
+    "pick_outer_margin": 58,
+    "bar_min_px": 5,           # min saturated pixels in an angle bin to light it up
+    "bar_persist_frames": 3,   # a bin must persist this many frames to count as a bar
+    "click_margin_deg": 8,     # treat a bar as this many degrees wider (click window)
     "latency_frames": 1.6,     # predict the pick this many frames ahead before clicking
     "click_cooldown": 0.10,    # s — min time between left clicks
     "vel_smooth": 0.5,         # angular-velocity EMA (0..1, lower = smoother)
     "coast_frames": 4,         # keep predicting this many frames after losing the pick
     "boost_mode": "always",    # "always" | "smart" | "off"
-    "smart_release_deg": 45,   # (smart) release RMB when a bar is within this many deg ahead
+    "smart_release_deg": 45,   # (smart) ease off RMB when a bar is within this many deg ahead
     "click_hold": 0.008,       # s — left button down duration
 }
 
@@ -96,8 +100,6 @@ def save_config(cfg):
 
 
 # --------------------------- mouse output -----------------------------------
-# Low-level SendInput mouse events (games that ignore synthetic clicks are rare;
-# SendInput is what most trainers use and it works with Dota's Panorama UI).
 
 _SendInput = ctypes.windll.user32.SendInput
 _PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -159,72 +161,65 @@ def ang_norm(a):
 
 
 def ang_diff(a, b):
-    """Shortest signed difference a-b in (-180, 180]."""
     return (a - b + 180.0) % 360.0 - 180.0
+
+
+def dilate_mask(mask, margin_idx):
+    """Widen a boolean ring mask by +/- margin_idx samples (wraps around)."""
+    if margin_idx <= 0:
+        return mask
+    out = mask.copy()
+    for s in range(1, margin_idx + 1):
+        out |= np.roll(mask, s) | np.roll(mask, -s)
+    return out
 
 
 # --------------------------- detection --------------------------------------
 
 class Dial:
-    """Precomputed ring sampling + moving-pick tracker for one calibrated dial."""
+    """Tracks the moving pick (by motion) and the bars (by saturation + persistence)."""
 
     def __init__(self, cfg, W, H):
         self.cfg = cfg
         self.W, self.H = W, H
         cx, cy = cfg["center"]
         r = cfg["radius"]
-        rw = cfg["ring_width"]
         n = cfg["n_samples"]
         self.cx, self.cy, self.r, self.n = cx, cy, r, n
 
-        # Precompute (radius x angle) sample coordinates for the annulus.
-        radii = np.arange(r - rw // 2, r + rw // 2 + 1)
-        ang = np.deg2rad(np.arange(n) * (360.0 / n))
-        cos, sin = np.cos(ang), np.sin(ang)
-        xs = (cx + np.outer(radii, cos)).round().astype(np.int32)
-        ys = (cy + np.outer(radii, sin)).round().astype(np.int32)
-        np.clip(xs, 0, W - 1, out=xs)
-        np.clip(ys, 0, H - 1, out=ys)
-        self._xs, self._ys = xs, ys
-
-        # Boolean annulus mask (region-sized) for restricting the pick frame-diff.
         Y, X = np.ogrid[0:H, 0:W]
         dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
-        self.ring_mask = ((dist >= r - rw) & (dist <= r + rw)).astype(np.uint8) * 255
+        ang = (np.degrees(np.arctan2(Y - cy, X - cx)) % 360.0)
+        self.ang_idx = np.minimum((ang * n / 360.0).round().astype(np.int32), n - 1)
+
+        self.bar_annulus = ((dist >= r - cfg["bar_inner_margin"]) &
+                            (dist <= r + cfg["bar_outer_margin"]))
+        self.pick_ring = (((dist >= r - cfg["pick_inner_margin"]) &
+                           (dist <= r + cfg["pick_outer_margin"])).astype(np.uint8) * 255)
 
         self.prev_gray = None
-        self.angle = None          # last pick angle (deg)
-        self.vel = 0.0             # deg/frame (EMA, signed)
+        self.angle = None
+        self.vel = 0.0
         self.lost = 0
+        self.bar_persist = np.zeros(n, np.int32)
+        self.bars = np.zeros(n, bool)
 
-    def sample_ring(self, bgr):
-        """Mean BGR colour at each of n angles around the ring -> (n, 3) float."""
-        ring = bgr[self._ys, self._xs, :3].astype(np.float32)  # (radii, n, 3)
-        return ring.mean(axis=0)
-
-    def bar_mask(self, ring):
-        """Boolean (n,) — angles whose ring colour matches the yellow or blue bar."""
-        cfg = self.cfg
-        tol = cfg["color_tol"]
-        y = np.array(cfg["yellow_color"], np.float32)
-        b = np.array(cfg["blue_color"], np.float32)
-        my = np.all(np.abs(ring - y) <= tol, axis=1)
-        mb = np.all(np.abs(ring - b) <= tol, axis=1)
-        return my | mb
-
-    def update_pick(self, gray):
-        """Track the rotating pick's angle via frame-difference in the ring."""
-        if self.prev_gray is None:
-            self.prev_gray = gray
-            return None
-        diff = cv2.absdiff(gray, self.prev_gray)
+    def update(self, gray, bgr):
+        moving = None
+        if self.prev_gray is not None:
+            diff = cv2.absdiff(gray, self.prev_gray)
+            _, mv = cv2.threshold(diff, self.cfg["diff_thresh"], 255, cv2.THRESH_BINARY)
+            moving = cv2.dilate(mv, np.ones((3, 3), np.uint8))
+            self._track_pick(cv2.bitwise_and(mv, self.pick_ring))
+        else:
+            self._coast()
         self.prev_gray = gray
-        _, mask = cv2.threshold(diff, self.cfg["diff_thresh"], 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_and(mask, self.ring_mask)
-        n, _, stats, cent = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        self._update_bars(bgr, moving)
+
+    def _track_pick(self, pick_mask):
+        n, _, stats, cent = cv2.connectedComponentsWithStats(pick_mask, connectivity=8)
         if n <= 1:
             return self._coast()
-        # largest moving blob = the pick
         i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         if stats[i, cv2.CC_STAT_AREA] < self.cfg["min_move_area"]:
             return self._coast()
@@ -242,25 +237,27 @@ class Dial:
         self.lost += 1
         if self.angle is not None and self.lost <= self.cfg["coast_frames"]:
             self.angle = ang_norm(self.angle + self.vel)
-            return self.angle
         return None
 
+    def _update_bars(self, bgr, moving):
+        img = bgr.astype(np.int16)
+        maxc = img.max(axis=2)
+        minc = img.min(axis=2)
+        sat = ((maxc - minc) >= self.cfg["sat_min"]) & (maxc >= self.cfg["v_min"])
+        sat &= self.bar_annulus
+        if moving is not None:
+            sat &= (moving == 0)              # drop the moving pick & flying sparks
+        counts = np.bincount(self.ang_idx[sat], minlength=self.n)
+        present = counts >= self.cfg["bar_min_px"]
+        self.bar_persist = np.where(present,
+                                    np.minimum(self.bar_persist + 1, 12), 0)
+        self.bars = self.bar_persist >= self.cfg["bar_persist_frames"]
+
     def predicted_index(self):
-        """Index into the ring where the pick will be after latency_frames."""
         if self.angle is None:
             return None
         pred = ang_norm(self.angle + self.vel * self.cfg["latency_frames"])
         return int(round(pred * self.n / 360.0)) % self.n
-
-
-def dilate_mask(mask, margin_idx):
-    """Widen a boolean ring mask by +/- margin_idx samples (wraps around)."""
-    if margin_idx <= 0:
-        return mask
-    out = mask.copy()
-    for s in range(1, margin_idx + 1):
-        out |= np.roll(mask, s) | np.roll(mask, -s)
-    return out
 
 
 # --------------------------- calibration ------------------------------------
@@ -296,8 +293,7 @@ def calibrate(cfg):
     cx, cy = win32api.GetCursorPos()
     cfg["center"] = [int(cx - left), int(cy - top)]
 
-    print(" 4) Mouse onto the RING where the pick travels (any point on the circle),")
-    print("    press F4")
+    print(" 4) Mouse onto a BAR / the ring where the bars appear, press F4")
     _wait_key("f4")
     rx, ry = win32api.GetCursorPos()
     r = int(round(math.hypot(rx - cx, ry - cy)))
@@ -357,7 +353,6 @@ class Bot:
         last = time.perf_counter()
         fps = 0.0
         last_click = 0.0
-        bars_seen = 0
         try:
             with mss.mss() as sct:
                 while not self.quit:
@@ -365,35 +360,32 @@ class Bot:
                     gray = cv2.cvtColor(shot, cv2.COLOR_BGRA2GRAY)
                     bgr = shot[:, :, :3]
 
-                    dial.update_pick(gray)
-                    ring = dial.sample_ring(bgr)
-                    bars = dial.bar_mask(ring)
+                    dial.update(gray, bgr)
+                    bars = dial.bars
                     bars_seen = int(bars.sum())
                     bars_wide = dilate_mask(bars, margin_idx)
-
                     pidx = dial.predicted_index()
                     reliable = dial.angle is not None and dial.lost <= 2
 
                     now = time.perf_counter()
                     clicked = False
                     boosting = False
-                    if self.active and reliable and pidx is not None:
-                        on_bar = bool(bars_wide[pidx])
-                        # --- left click on a bar ---
-                        if on_bar and bars_seen >= cfg["min_bar_samples"] \
+                    if self.active:
+                        # --- left click when the predicted pick lands on a bar ---
+                        if reliable and pidx is not None and bars_seen > 0 \
+                                and bars_wide[pidx] \
                                 and now - last_click >= cfg["click_cooldown"]:
                             self.mouse.left_click(cfg["click_hold"])
                             last_click = now
                             clicked = True
-                        # --- right-button speed boost ---
+                        # --- right-button speed boost (independent of tracking) ---
                         mode = cfg.get("boost_mode", "always")
                         if mode == "off":
                             boosting = False
-                        elif mode == "always":
-                            boosting = True
-                        else:  # smart: boost unless a bar is just ahead
-                            ahead = dilate_mask(bars, smart_idx)
-                            boosting = not bool(ahead[pidx])
+                        elif mode == "smart" and reliable and pidx is not None:
+                            boosting = not bool(dilate_mask(bars, smart_idx)[pidx])
+                        else:
+                            boosting = True   # "always", or "smart" with no lock yet
                         self.mouse.right_hold(boosting)
                     else:
                         self.mouse.right_hold(False)
@@ -416,24 +408,21 @@ class Bot:
     def _draw(self, bgr, dial, bars, pidx, clicked, boosting, bars_seen, fps):
         img = bgr.copy()
         cx, cy, r, n = dial.cx, dial.cy, dial.r, dial.n
-        cv2.circle(img, (int(cx), int(cy)), int(r), (80, 80, 80), 1)
-        cv2.circle(img, (int(cx), int(cy)), 2, (80, 80, 80), -1)
-        # highlight detected bars
+        cv2.circle(img, (int(cx), int(cy)), int(r), (70, 70, 70), 1)
+        cv2.drawMarker(img, (int(cx), int(cy)), (70, 70, 70), cv2.MARKER_CROSS, 8, 1)
         for i in np.where(bars)[0]:
             a = math.radians(i * 360.0 / n)
             x = int(cx + r * math.cos(a)); y = int(cy + r * math.sin(a))
-            cv2.circle(img, (x, y), 2, (0, 255, 255), -1)
-        # pick position
+            cv2.circle(img, (x, y), 3, (0, 215, 255), -1)
         if dial.angle is not None:
             a = math.radians(dial.angle)
             x = int(cx + r * math.cos(a)); y = int(cy + r * math.sin(a))
             cv2.circle(img, (x, y), 6, (0, 255, 0), 2)
             cv2.line(img, (int(cx), int(cy)), (x, y), (0, 255, 0), 1)
-        # predicted click point
         if pidx is not None:
             a = math.radians(pidx * 360.0 / n)
             x = int(cx + r * math.cos(a)); y = int(cy + r * math.sin(a))
-            cv2.drawMarker(img, (x, y), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 12, 2)
+            cv2.drawMarker(img, (x, y), (255, 0, 255), cv2.MARKER_TILTED_CROSS, 14, 2)
         state = "ACTIVE" if self.active else "paused"
         col = (0, 255, 0) if self.active else (180, 180, 180)
         tags = ("CLICK " if clicked else "") + ("BOOST" if boosting else "")

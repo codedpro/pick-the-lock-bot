@@ -108,12 +108,12 @@ Saved to `config.json`. Then run **`run.bat`**, put your cursor over the dial, f
 | Field | Meaning |
 |-------|---------|
 | `boost_mode` | `"always"` (max speed), `"smart"` (release before a bar), or `"off"` |
-| `yellow_color` / `blue_color` | Bar colours in **BGR**; adjust if bars aren't detected (see 🩺 below) |
-| `color_tol` | Colour match tolerance (raise if bars flicker in/out) |
+| `sat_min` / `v_min` | How "colourful"/bright a pixel must be to count as a bar — **lower these if bars aren't detected** |
+| `bar_inner_margin` / `bar_outer_margin` | Width of the ring band searched for bars (around the calibrated `radius`) |
+| `bar_persist_frames` | Frames a bar must persist to count (rejects the moving pick/sparks); lower for faster reaction |
 | `latency_frames` | How far ahead the click is predicted — raise if it clicks **late**, lower if **early** |
 | `click_margin_deg` | Click window width in degrees around a bar |
 | `click_cooldown` | Min seconds between clicks (raise if it double-clicks one pass) |
-| `radius` / `ring_width` | Ring geometry; widen `ring_width` if the pick isn't tracked reliably |
 | `smart_release_deg` | (smart mode) how far ahead of a bar to ease off the boost |
 
 ---
@@ -122,9 +122,9 @@ Saved to `config.json`. Then run **`run.bat`**, put your cursor over the dial, f
 
 | Problem | Fix |
 |---------|-----|
-| **Nothing clicks / `bars=0` in preview** | The bar colours don't match. Run **`capture.bat`**, then tweak `yellow_color` / `blue_color` (BGR) or raise `color_tol`. |
+| **Nothing clicks / `bars=0` in preview** | Bars aren't bright enough to register. Lower `sat_min` and `v_min`, or widen `bar_inner_margin` / `bar_outer_margin`. Re-check calibration (F4 should be on the bar ring). |
 | **Clicks land just before/after the bar** | Adjust `latency_frames` (raise = later, lower = earlier). |
-| **The green pick marker jitters / is lost** | Increase `ring_width`, or lower `diff_thresh`. Make sure `fps_max_ui 30` is set. |
+| **The green pick marker jitters / is lost** | Lower `diff_thresh`, or widen `pick_inner_margin` / `pick_outer_margin`. Make sure `fps_max_ui 30` is set. |
 | **It double-clicks one pass** | Raise `click_cooldown`. |
 | **Too many misses at max speed** | Set `boost_mode` to `"smart"` or `"off"`. |
 | **Still stuck?** | Run **`capture.bat`** and open an issue with the image. |
