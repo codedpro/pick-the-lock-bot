@@ -9,9 +9,10 @@ build/
 dist/
 *.spec
 
-# Diagnostic images produced by diag.bat / capture.bat
+# Diagnostic images produced by diag.bat / capture.bat / record.bat
 diag_*.png
 capture_*.png
+diag/
 
 # Personal calibration (screen coords differ per machine — each user calibrates).
 # A config.example.json is shipped instead; first launch generates config.json.

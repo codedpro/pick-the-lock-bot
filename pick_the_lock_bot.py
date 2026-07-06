@@ -71,6 +71,9 @@ DEFAULTS = {
     "pick_outer_margin": 58,
     "bar_min_px": 5,           # min saturated pixels in an angle bin to light it up
     "bar_persist_frames": 3,   # a bin must persist this many frames to count as a bar
+    "min_bar_deg": 3,          # ignore specks narrower than this
+    "max_bar_deg": 55,         # ignore arcs WIDER than this (that's the static ring, not a bar)
+    "max_total_bar_deg": 170,  # if more of the circle than this lights up, it's the ring -> ignore all
     "click_margin_deg": 8,     # treat a bar as this many degrees wider (click window)
     "latency_frames": 1.6,     # predict the pick this many frames ahead before clicking
     "click_cooldown": 0.10,    # s — min time between left clicks
@@ -203,6 +206,7 @@ class Dial:
         self.lost = 0
         self.bar_persist = np.zeros(n, np.int32)
         self.bars = np.zeros(n, bool)
+        self.arcs = []
 
     def update(self, gray, bgr):
         moving = None
@@ -251,7 +255,42 @@ class Dial:
         present = counts >= self.cfg["bar_min_px"]
         self.bar_persist = np.where(present,
                                     np.minimum(self.bar_persist + 1, 12), 0)
-        self.bars = self.bar_persist >= self.cfg["bar_persist_frames"]
+        self.bars = self._filter_arcs(self.bar_persist >= self.cfg["bar_persist_frames"])
+
+    def _filter_arcs(self, mask):
+        """Keep only bar-sized arcs. Rejects the static full ring (a huge arc) and
+        1-2px specks, and drops everything if too much of the circle lights up."""
+        n = self.n
+        self.arcs = []
+        s = int(mask.sum())
+        if s == 0:
+            return mask
+        if s > self.cfg["max_total_bar_deg"] * n / 360.0:
+            return np.zeros(n, bool)          # basically the whole ring -> not real bars
+        idx = np.where(mask)[0]
+        runs = []
+        start = prev = idx[0]
+        for x in idx[1:]:
+            if x == prev + 1:
+                prev = x
+            else:
+                runs.append((start, prev)); start = prev = x
+        runs.append((start, prev))
+        # merge an arc that wraps past 0 degrees
+        if len(runs) >= 2 and runs[0][0] == 0 and runs[-1][1] == n - 1:
+            s0, e0 = runs.pop(0)
+            s1, e1 = runs.pop(-1)
+            runs.append((s1, e0 + n))
+        out = np.zeros(n, bool)
+        lo = self.cfg["min_bar_deg"] * n / 360.0
+        hi = self.cfg["max_bar_deg"] * n / 360.0
+        for a, b in runs:
+            L = b - a + 1
+            self.arcs.append((a % n, b % n, L))
+            if lo <= L <= hi:
+                for k in range(a, b + 1):
+                    out[k % n] = True
+        return out
 
     def predicted_index(self):
         if self.angle is None:
@@ -314,6 +353,8 @@ class Bot:
         self.preview = True
         self.quit = False
         self.win_ready = False
+        self.diag = False
+        self.diag_dir = os.path.join(HERE, "diag")
         self.mouse = MouseController()
 
     def _bind(self):
@@ -353,6 +394,15 @@ class Bot:
         last = time.perf_counter()
         fps = 0.0
         last_click = 0.0
+        logf = None
+        if self.diag:
+            os.makedirs(self.diag_dir, exist_ok=True)
+            logf = open(os.path.join(self.diag_dir, "diag_log.txt"), "w", encoding="utf-8")
+            t0 = time.perf_counter()
+            next_save = 0.0
+            frame_no = 0
+            print("[diag] Recording ~60s — NO clicks are sent. "
+                  "Press F8 to 'activate' and play normally.")
         try:
             with mss.mss() as sct:
                 while not self.quit:
@@ -370,15 +420,9 @@ class Bot:
                     now = time.perf_counter()
                     clicked = False
                     boosting = False
+                    would_click = (reliable and pidx is not None and bars_seen > 0
+                                   and bool(bars_wide[pidx]))
                     if self.active:
-                        # --- left click when the predicted pick lands on a bar ---
-                        if reliable and pidx is not None and bars_seen > 0 \
-                                and bars_wide[pidx] \
-                                and now - last_click >= cfg["click_cooldown"]:
-                            self.mouse.left_click(cfg["click_hold"])
-                            last_click = now
-                            clicked = True
-                        # --- right-button speed boost (independent of tracking) ---
                         mode = cfg.get("boost_mode", "always")
                         if mode == "off":
                             boosting = False
@@ -386,8 +430,14 @@ class Bot:
                             boosting = not bool(dilate_mask(bars, smart_idx)[pidx])
                         else:
                             boosting = True   # "always", or "smart" with no lock yet
-                        self.mouse.right_hold(boosting)
-                    else:
+                        if would_click and now - last_click >= cfg["click_cooldown"]:
+                            last_click = now
+                            clicked = True
+                        if not self.diag:                     # diag = observe only
+                            if clicked:
+                                self.mouse.left_click(cfg["click_hold"])
+                            self.mouse.right_hold(boosting)
+                    elif not self.diag:
                         self.mouse.right_hold(False)
 
                     dt = now - last
@@ -395,7 +445,24 @@ class Bot:
                     if dt > 0:
                         fps = 0.9 * fps + 0.1 * (1.0 / dt)
 
-                    if self.preview:
+                    if self.diag:
+                        ang = None if dial.angle is None else round(dial.angle, 1)
+                        logf.write(f"t={now - t0:6.2f} act={int(self.active)} "
+                                   f"fps={fps:4.0f} pick={ang} vel={round(dial.vel, 2)} "
+                                   f"lost={dial.lost} pidx={pidx} bars={bars_seen} "
+                                   f"arcs={dial.arcs} wclick={int(would_click)}\n")
+                        ov = self._draw(bgr, dial, bars, pidx, clicked, boosting,
+                                        bars_seen, fps)
+                        cv2.waitKey(1)
+                        if now - t0 >= next_save and frame_no < 60:
+                            cv2.imwrite(os.path.join(self.diag_dir,
+                                        f"frame_{frame_no:03d}.png"), ov)
+                            frame_no += 1
+                            next_save += 1.5
+                        if now - t0 >= 60.0:
+                            print("[diag] Done. 60s recorded.")
+                            break
+                    elif self.preview:
                         self._draw(bgr, dial, bars, pidx, clicked, boosting,
                                    bars_seen, fps)
                         if cv2.waitKey(1) & 0xFF == 27:
@@ -403,6 +470,9 @@ class Bot:
         finally:
             self.mouse.release_all()
             cv2.destroyAllWindows()
+            if logf is not None:
+                logf.close()
+                print(f"[diag] logs + frames saved in: {self.diag_dir}")
         print("[bot] stopped.")
 
     def _draw(self, bgr, dial, bars, pidx, clicked, boosting, bars_seen, fps):
@@ -438,15 +508,18 @@ class Bot:
                 pass
             self.win_ready = True
         cv2.imshow(PREVIEW_WIN, img)
+        return img
 
 
 def main():
     cfg = load_config()
+    diag = "--diag" in sys.argv
     if "--calibrate" in sys.argv or cfg.get("region") is None \
             or cfg.get("center") is None or cfg.get("radius") is None:
         cfg = calibrate(cfg)
     while True:
         bot = Bot(cfg)
+        bot.diag = diag
         recal = {"v": False}
         keyboard.add_hotkey("f7", lambda: (recal.__setitem__("v", True), bot._stop()))
         bot.run()
