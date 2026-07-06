@@ -1,0 +1,24 @@
+# Local virtual environment created by run.bat / calibrate.bat
+.venv/
+venv/
+
+# Python cache / build artifacts
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+
+# Diagnostic images produced by diag.bat / capture.bat
+diag_*.png
+capture_*.png
+
+# Personal calibration (screen coords differ per machine — each user calibrates).
+# A config.example.json is shipped instead; first launch generates config.json.
+config.json
+
+# Editor / OS cruft
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

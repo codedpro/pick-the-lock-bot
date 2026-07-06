@@ -1,0 +1,7 @@
+# Boot Breaker Bot — Python dependencies
+# Installed automatically by run.bat / calibrate.bat into a local .venv folder.
+numpy>=1.26
+opencv-python>=4.9
+mss>=9.0
+pywin32>=306
+keyboard>=0.13.5

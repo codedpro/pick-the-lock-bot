@@ -1,0 +1,22 @@
+{
+  "_comment": "Example config. Do NOT edit region/center/radius by hand — run calibrate.bat (or press F7 in the bot) to set them for YOUR screen. Bar colours (yellow_color/blue_color) are BGR and can be tuned; run capture.bat and adjust if bars aren't detected.",
+  "region": null,
+  "center": null,
+  "radius": null,
+  "ring_width": 16,
+  "n_samples": 360,
+  "diff_thresh": 16,
+  "min_move_area": 4,
+  "yellow_color": [40, 205, 240],
+  "blue_color": [235, 175, 45],
+  "color_tol": 60,
+  "min_bar_samples": 3,
+  "click_margin_deg": 7,
+  "latency_frames": 1.6,
+  "click_cooldown": 0.1,
+  "vel_smooth": 0.5,
+  "coast_frames": 4,
+  "boost_mode": "always",
+  "smart_release_deg": 45,
+  "click_hold": 0.008
+}
